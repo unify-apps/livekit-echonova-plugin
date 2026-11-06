@@ -185,12 +185,21 @@ class _SocketPool:
             await asyncio.wait(self._cancelling)
         while True:
             ws = await self._pool.get(timeout=conn_options.timeout)
-            if (idle := self._idle.pop(ws, None)) is not None:
-                await utils.aio.gracefully_cancel(idle)
+            await self._take(ws)
             fresh = time.monotonic() - self._opened_at.get(ws, time.monotonic()) < SESSION_SECONDS - SESSION_MARGIN
             if fresh and not ws.closed:
                 return ws
             self._pool.remove(ws)
+
+    async def _take(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        """Stop the idle reader of a socket a request takes; a request cancelled meanwhile gives it back."""
+        if (idle := self._idle.pop(ws, None)) is None:
+            return
+        try:
+            await utils.aio.gracefully_cancel(idle)
+        except asyncio.CancelledError:  # parked once the reader stops, so two never read one socket
+            idle.add_done_callback(lambda _: self._park(ws))
+            raise
 
     def release(self, ws: aiohttp.ClientWebSocketResponse, *, settled: bool, failed: bool) -> None:
         if failed:

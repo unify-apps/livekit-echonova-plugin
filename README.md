@@ -6,7 +6,7 @@ English, for [LiveKit Agents](https://github.com/livekit/agents).
 ## Installation
 
 ```bash
-pip install "git+https://github.com/unify-apps/livekit-echonova-plugin.git@v1.0.0"
+pip install "git+https://github.com/unify-apps/livekit-echonova-plugin.git@v1.0.2"
 ```
 
 ## Pre-requisites

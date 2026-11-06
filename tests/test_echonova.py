@@ -752,6 +752,22 @@ async def test_tts_idle_socket_answers_server_pings(http: aiohttp.ClientSession)
     assert spoken(audio) == SAMPLES
 
 
+async def test_tts_cancelled_reply_keeps_the_pooled_socket(http: aiohttp.ClientSession) -> None:
+    # a reply cancelled at any point, even while its socket's idle reader stops, leaves the socket usable
+    for ticks in range(8):
+        async with FakeEchoNova() as fake, echonova_tts(fake, http) as tts:
+            await stream_text(tts, SENTENCE_A)
+            stream = tts.stream(conn_options=FAST)
+            stream.push_text(SENTENCE_B)
+            stream.end_input()
+            for _ in range(ticks):
+                await asyncio.sleep(0)
+            await stream.aclose()
+            await asyncio.sleep(0.05)
+            await stream_text(tts, SENTENCE_A)
+        assert fake.connections == 1, ticks
+
+
 async def test_tts_retry_rules(http: aiohttp.ClientSession) -> None:
     text = f"{SENTENCE_A} {SENTENCE_B}"
     # a later sentence that failed before any of its audio is sent again
@@ -850,6 +866,7 @@ async def main() -> None:
             test_tts_releases_audio_before_done,
             test_tts_interrupt_keeps_the_socket_warm,
             test_tts_idle_socket_answers_server_pings,
+            test_tts_cancelled_reply_keeps_the_pooled_socket,
             test_tts_retry_rules,
             test_tts_errors,
             test_tts_handshake_refusals,
