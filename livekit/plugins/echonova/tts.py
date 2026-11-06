@@ -167,6 +167,7 @@ class _SocketPool:
         )
         self._opened_at: dict[aiohttp.ClientWebSocketResponse, float] = {}
         self._cancelling: set[asyncio.Task[None]] = set()
+        self._readers: dict[aiohttp.ClientWebSocketResponse, asyncio.Task[None]] = {}
 
     @property
     def last_acquire_time(self) -> float:
@@ -185,6 +186,10 @@ class _SocketPool:
             await asyncio.wait(self._cancelling)
         while True:
             ws = await self._pool.get(timeout=conn_options.timeout)
+            await self._stop_reading(ws)
+            if ws.closed:  # ended while it waited in the pool
+                self._pool.remove(ws)
+                continue
             if time.monotonic() - self._opened_at.get(ws, time.monotonic()) < SESSION_SECONDS - SESSION_MARGIN:
                 return ws
             self._pool.remove(ws)
@@ -194,6 +199,7 @@ class _SocketPool:
             self._pool.remove(ws)
         elif settled:
             self._pool.put(ws)
+            self._start_reading(ws)
         else:  # interrupted mid-synthesis: keep the warm socket
             task = asyncio.create_task(self._cancel(ws))
             self._cancelling.add(task)
@@ -209,10 +215,12 @@ class _SocketPool:
             async with asyncio.timeout(connect_timeout):
                 ws = await self._open_socket()
         self._opened_at[ws] = time.monotonic()
+        self._start_reading(ws)  # a prewarmed socket waits in the pool too
         return ws
 
     async def _close(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         self._opened_at.pop(ws, None)
+        await self._stop_reading(ws)
         await ws.close()
 
     async def _cancel(self, ws: aiohttp.ClientWebSocketResponse) -> None:
@@ -232,8 +240,28 @@ class _SocketPool:
         finally:
             if reusable:
                 self._pool.put(ws)
+                self._start_reading(ws)
             else:
                 self._pool.remove(ws)
+
+    def _start_reading(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        self._readers[ws] = asyncio.create_task(self._read_idle(ws))
+
+    async def _stop_reading(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        if (reader := self._readers.pop(ws, None)) is not None:
+            await utils.aio.cancel_and_wait(reader)
+
+    async def _read_idle(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        """Read a socket while it waits in the pool.
+
+        The server pings every 25 s and drops a socket that has not answered by its next ping, and aiohttp
+        answers pings only inside receive(), so a socket nobody reads dies 25-50 s after its last reply.
+        """
+        while True:
+            msg = await ws.receive()
+            if msg.type in SOCKET_ENDED:
+                self._pool.remove(ws)
+                return
 
 
 class TTS(tts.TTS):

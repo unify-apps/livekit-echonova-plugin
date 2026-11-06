@@ -207,6 +207,8 @@ class FakeEchoNova:
     answer_cancel: bool = True  # a cancel gets late frames, then cancelled
     # how an unanswered, interrupted synthesis ends once the next one arrives, as the real stream does
     late_event: str = "done"
+    # pings every this many seconds and drops a socket that missed the last one, as the real stream does every 25 s
+    ping_interval: float | None = None
     running: str = ""  # the requestId of the last synthesize
     unfinished: str = ""  # a synthesis hang_after_audio left running
     connections: int = 0
@@ -231,12 +233,33 @@ class FakeEchoNova:
             status, headers = self.refuse
             return web.json_response({"success": False, "statusCode": status}, status=status, headers=headers)
         self.connections += 1
-        ws = web.WebSocketResponse()
+        ws = web.WebSocketResponse(autoping=self.ping_interval is None)
         await ws.prepare(request)
-        async for raw in ws:
-            if raw.type == aiohttp.WSMsgType.TEXT and not await self._on_message(ws, json.loads(raw.data)):
-                break
+        answered = asyncio.Event()
+        answered.set()
+        liveness = asyncio.create_task(self._drop_unanswered(ws, request, answered)) if self.ping_interval else None
+        try:
+            async for raw in ws:
+                if raw.type == aiohttp.WSMsgType.PONG:
+                    answered.set()
+                elif raw.type == aiohttp.WSMsgType.PING:
+                    await ws.pong(raw.data)
+                elif raw.type == aiohttp.WSMsgType.TEXT and not await self._on_message(ws, json.loads(raw.data)):
+                    break
+        finally:
+            if liveness:
+                liveness.cancel()
         return ws
+
+    async def _drop_unanswered(self, ws: web.WebSocketResponse, request: web.Request, answered: asyncio.Event) -> None:
+        assert self.ping_interval and request.transport
+        while True:
+            await asyncio.sleep(self.ping_interval)
+            if not answered.is_set():
+                request.transport.close()  # no close frame: the client sees 1006, as from the real server
+                return
+            answered.clear()
+            await ws.ping()
 
     async def _on_message(self, ws: web.WebSocketResponse, msg: dict) -> bool:
         if msg["type"] == "cancel" and self.answer_cancel:
@@ -817,6 +840,16 @@ async def test_list_voices(http: aiohttp.ClientSession) -> None:
     assert voices[0]["id"] == "v"
 
 
+async def test_tts_idle_socket_answers_server_pings(http: aiohttp.ClientSession) -> None:
+    # a pooled socket nobody reads must still answer the server's pings, or the next reply finds it dropped
+    async with FakeEchoNova(ping_interval=0.1) as fake, echonova_tts(fake, http) as tts:
+        await stream_text(tts, SENTENCE_A)
+        await asyncio.sleep(0.5)
+        audio, _ = await stream_text(tts, SENTENCE_B, NO_RETRY)
+    assert fake.connections == 1
+    assert spoken(audio) == SAMPLES
+
+
 async def main() -> None:
     test_constructor_validation()
     async with aiohttp.ClientSession() as http:
@@ -835,6 +868,7 @@ async def main() -> None:
             test_tts_stream_splits_long_sentence,
             test_tts_releases_audio_before_done,
             test_tts_interrupt_keeps_the_socket_warm,
+            test_tts_idle_socket_answers_server_pings,
             test_tts_retry_rules,
             test_tts_errors,
             test_tts_handshake_refusals,
