@@ -50,8 +50,10 @@ SPEED_RANGE = (0.5, 2.0)
 CFG_RANGE = (1.0, 5.0)
 NUM_STEPS = (16, 32, 48, 64, 128)
 
-# a socket unused for longer is replaced: below the server's 120 s idle timeout, so none is closed under us
-POOL_IDLE_LIMIT = 100.0
+# an idle pooled socket is read, so aiohttp answers the server's pings (the server drops a socket that
+# leaves them unanswered), and sends a ping this often, inside the server's 120 s idle timeout
+KEEPALIVE_INTERVAL = 30.0
+_PING = json.dumps({"type": "ping"})
 # the server ends a session at 30 minutes; a socket is retired this long before
 SESSION_SECONDS = 30 * 60
 SESSION_MARGIN = 60.0
@@ -158,15 +160,13 @@ class _SocketPool:
 
     def __init__(self, open_socket: Callable[[], Awaitable[aiohttp.ClientWebSocketResponse]]) -> None:
         self._open_socket = open_socket
-        # reused while used every POOL_IDLE_LIMIT, so a busy socket lasts the call
         self._pool = utils.ConnectionPool[aiohttp.ClientWebSocketResponse](
-            connect_cb=self._connect,
-            close_cb=self._close,
-            max_session_duration=POOL_IDLE_LIMIT,
-            mark_refreshed_on_get=True,
+            connect_cb=self._connect, close_cb=self._close
         )
         self._opened_at: dict[aiohttp.ClientWebSocketResponse, float] = {}
         self._cancelling: set[asyncio.Task[None]] = set()
+        # the reader of each socket not in use: none is left with its pings unanswered
+        self._idle: dict[aiohttp.ClientWebSocketResponse, asyncio.Task[None]] = {}
 
     @property
     def last_acquire_time(self) -> float:
@@ -185,7 +185,10 @@ class _SocketPool:
             await asyncio.wait(self._cancelling)
         while True:
             ws = await self._pool.get(timeout=conn_options.timeout)
-            if time.monotonic() - self._opened_at.get(ws, time.monotonic()) < SESSION_SECONDS - SESSION_MARGIN:
+            if (idle := self._idle.pop(ws, None)) is not None:
+                await utils.aio.gracefully_cancel(idle)
+            fresh = time.monotonic() - self._opened_at.get(ws, time.monotonic()) < SESSION_SECONDS - SESSION_MARGIN
+            if fresh and not ws.closed:
                 return ws
             self._pool.remove(ws)
 
@@ -193,15 +196,39 @@ class _SocketPool:
         if failed:
             self._pool.remove(ws)
         elif settled:
-            self._pool.put(ws)
+            self._park(ws)
         else:  # interrupted mid-synthesis: keep the warm socket
             task = asyncio.create_task(self._cancel(ws))
             self._cancelling.add(task)
             task.add_done_callback(self._cancelling.discard)
 
     async def aclose(self) -> None:
-        await utils.aio.gracefully_cancel(*self._cancelling)
+        await utils.aio.gracefully_cancel(*self._cancelling, *self._idle.values())
+        self._idle.clear()
         await self._pool.aclose()
+
+    def _park(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        self._pool.put(ws)
+        self._idle[ws] = asyncio.create_task(self._keep_alive(ws))
+
+    async def _keep_alive(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        """Read an idle socket until a request takes it; one the server closes leaves the pool now."""
+        try:
+            while True:
+                try:
+                    async with asyncio.timeout(KEEPALIVE_INTERVAL):
+                        msg = await ws.receive()
+                except TimeoutError:
+                    await ws.send_str(_PING)
+                    continue
+                if msg.type in SOCKET_ENDED:
+                    break
+                # anything else is a pong, or a late frame or event of an interrupted request
+        except (aiohttp.ClientError, OSError) as e:
+            logger.debug("echonova tts idle socket failed: %s", e)
+        if self._idle.get(ws) is asyncio.current_task():
+            del self._idle[ws]
+        self._pool.remove(ws)
 
     async def _connect(self, connect_timeout: float) -> aiohttp.ClientWebSocketResponse:
         """The pool's connect callback: the pool hands it the time it may take."""
@@ -209,10 +236,14 @@ class _SocketPool:
             async with asyncio.timeout(connect_timeout):
                 ws = await self._open_socket()
         self._opened_at[ws] = time.monotonic()
+        # a prewarmed socket waits in the pool: it is read like any other idle one
+        self._idle[ws] = asyncio.create_task(self._keep_alive(ws))
         return ws
 
     async def _close(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         self._opened_at.pop(ws, None)
+        if (idle := self._idle.pop(ws, None)) is not None:
+            await utils.aio.gracefully_cancel(idle)
         await ws.close()
 
     async def _cancel(self, ws: aiohttp.ClientWebSocketResponse) -> None:
@@ -231,7 +262,7 @@ class _SocketPool:
             logger.debug("echonova tts closed a socket it could not cancel on: %s", e)
         finally:
             if reusable:
-                self._pool.put(ws)
+                self._park(ws)
             else:
                 self._pool.remove(ws)
 

@@ -204,6 +204,7 @@ class FakeEchoNova:
 
     plan: list[Behaviour] = field(default_factory=list)
     refuse: tuple[int, dict[str, str]] | None = None  # status and headers for every stream upgrade
+    tts_heartbeat: float | None = None  # ping the TTS socket this often and drop it unanswered, as EchoNova does
     answer_cancel: bool = True  # a cancel gets late frames, then cancelled
     # how an unanswered, interrupted synthesis ends once the next one arrives, as the real stream does
     late_event: str = "done"
@@ -231,7 +232,7 @@ class FakeEchoNova:
             status, headers = self.refuse
             return web.json_response({"success": False, "statusCode": status}, status=status, headers=headers)
         self.connections += 1
-        ws = web.WebSocketResponse()
+        ws = web.WebSocketResponse(heartbeat=self.tts_heartbeat)
         await ws.prepare(request)
         async for raw in ws:
             if raw.type == aiohttp.WSMsgType.TEXT and not await self._on_message(ws, json.loads(raw.data)):
@@ -741,6 +742,16 @@ async def test_tts_interrupt_keeps_the_socket_warm(http: aiohttp.ClientSession) 
     assert fake.connections == 2
 
 
+async def test_tts_idle_socket_answers_server_pings(http: aiohttp.ClientSession) -> None:
+    # pinged while it waits in the pool between replies: an unanswered ping costs the next reply its socket
+    async with FakeEchoNova(tts_heartbeat=0.1) as fake, echonova_tts(fake, http) as tts:
+        await stream_text(tts, SENTENCE_A)
+        await asyncio.sleep(0.5)
+        audio, _ = await stream_text(tts, SENTENCE_B, NO_RETRY)
+    assert fake.connections == 1
+    assert spoken(audio) == SAMPLES
+
+
 async def test_tts_retry_rules(http: aiohttp.ClientSession) -> None:
     text = f"{SENTENCE_A} {SENTENCE_B}"
     # a later sentence that failed before any of its audio is sent again
@@ -781,6 +792,9 @@ async def test_tts_errors(http: aiohttp.ClientSession) -> None:
     async with FakeEchoNova(plan=[hang_after_audio]) as fake, echonova_tts(fake, http) as tts:
         stalled = APIConnectOptions(max_retry=0, timeout=0.5)
         await expect(APITimeoutError, stream_text(tts, SENTENCE_A, stalled))
+        # a socket that failed is closed, never handed to the next reply
+        await stream_text(tts, SENTENCE_B)
+    assert fake.connections == 2
 
     tts = echonova.TTS(api_key="k", voice_id="v", base_url="http://127.0.0.1:9", http_session=http)
     await expect(APIConnectionError, stream_text(tts, SENTENCE_A, NO_RETRY))
@@ -835,6 +849,7 @@ async def main() -> None:
             test_tts_stream_splits_long_sentence,
             test_tts_releases_audio_before_done,
             test_tts_interrupt_keeps_the_socket_warm,
+            test_tts_idle_socket_answers_server_pings,
             test_tts_retry_rules,
             test_tts_errors,
             test_tts_handshake_refusals,
